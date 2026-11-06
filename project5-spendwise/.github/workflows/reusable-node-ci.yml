@@ -1,0 +1,43 @@
+name: Reusable Node.js CI
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        required: true
+        type: string
+        description: "Path to project folder (e.g. backend or frontend)"
+      node-version:
+        required: false
+        type: string
+        default: "20"
+        description: "Node.js LTS runtime version"
+
+jobs:
+  validate:
+    name: Verify (${{ inputs.working-directory }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ inputs.node-version }} with Cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Install Dependencies
+        working-directory: ${{ inputs.working-directory }}
+        run: npm ci
+
+      - name: Run Tests (if script exists)
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          if npm run | grep -q "test"; then
+            npm test
+          else
+            echo "No test script found, skipping tests."
+          fi
+

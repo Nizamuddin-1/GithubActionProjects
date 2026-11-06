@@ -1,0 +1,162 @@
+name: SpendWise Master Deployment & Rollback Pipeline
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  ci-backend:
+    name: Call Reusable Backend CI
+    uses: ./.github/workflows/reusable-node-ci.yml
+    with:
+      working-directory: backend
+      node-version: "20"
+
+  ci-frontend:
+    name: Call Reusable Frontend CI
+    uses: ./.github/workflows/reusable-node-ci.yml
+    with:
+      working-directory: frontend
+      node-version: "20"
+
+  deploy-backend:
+    name: Deploy Backend to Lambda
+    needs: [ ci-backend ]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Backup Current Live Lambda Function Code
+        id: backup
+        run: |
+          CURRENT_URL=$(aws lambda get-function --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} --query 'Code.Location' --output text)
+          curl -s "$CURRENT_URL" -o previous-release.zip
+          aws s3 cp previous-release.zip s3://${{ secrets.S3_BACKUP_BUCKET }}/previous-release.zip
+
+      - name: Build Lambda Production Bundle
+        working-directory: ./backend
+        run: |
+          npm ci --omit=dev
+          zip -r ../lambda-deploy.zip src package.json node_modules
+
+      - name: Update Lambda Function Code
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
+            --zip-file fileb://lambda-deploy.zip
+
+      - name: Post-Deployment Smoke Test
+        run: |
+          echo "Waiting 10 seconds for Lambda rollout..."
+          sleep 10
+          API_URL="${{ secrets.LAMBDA_FUNCTION_URL }}"
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/api/health")
+          echo "Smoke check response: $RESPONSE"
+          if [ "$RESPONSE" != "200" ]; then
+            echo "CRITICAL: Health check returned $RESPONSE! Initiating rollback..."
+            exit 1
+          fi
+          echo "Smoke test passed successfully!"
+
+  rollback-backend:
+    name: Automatic Rollback to Previous Version
+    needs: [ deploy-backend ]
+    if: failure() && needs.deploy-backend.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Restore Previous Lambda Code from S3 Backup
+        run: |
+          aws s3 cp s3://${{ secrets.S3_BACKUP_BUCKET }}/previous-release.zip ./previous-release.zip
+          aws lambda update-function-code \
+            --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
+            --zip-file fileb://previous-release.zip
+          echo "Rollback completed. Restored stable release."
+
+  deploy-frontend:
+    name: Deploy Frontend
+    needs: [ ci-frontend, deploy-backend ]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build Frontend Bundle
+        working-directory: ./frontend
+        env:
+          VITE_API_URL: ${{ secrets.LAMBDA_FUNCTION_URL }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Sync to S3 & Invalidate CloudFront
+        run: |
+          aws s3 sync ./frontend/dist s3://${{ secrets.S3_FRONTEND_BUCKET }} --delete
+          aws cloudfront create-invalidation --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} --paths "/*"
+
+  notify:
+    name: Pipeline Status Alert
+    needs: [ deploy-backend, rollback-backend, deploy-frontend ]
+    if: always() && github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Webhook Notification
+        run: |
+          STATUS="SUCCESS"
+          if [ "${{ needs.deploy-backend.result }}" == "failure" ]; then
+            STATUS="FAILED & ROLLED BACK"
+          fi
+          
+          PAYLOAD=$(cat <<EOF
+          {
+            "text": "SpendWise Pipeline Alert: Status is *$STATUS* for commit \`${{ github.sha }}\` by *${{ github.actor }}*."
+          }
+          EOF
+          )
+          
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "${{ secrets.SLACK_WEBHOOK_URL }}"
+          else
+            echo "No Slack webhook configured. Status: $STATUS"
+          fi
+
